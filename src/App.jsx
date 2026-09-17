@@ -1,8 +1,20 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Canvas } from '@react-three/fiber';
-import { OrbitControls, Stars, Text, Html, Tube } from '@react-three/drei';
-import * as THREE from 'three';
 import { motion } from 'framer-motion';
+
+import GlobeScene from './components/GlobeScene.jsx';
+import {
+  fetchGlobalFields,
+  sampleField,
+  fieldExtent,
+  LAT_STEP,
+  LON_STEP,
+  PAST_DAYS,
+  FORECAST_DAYS,
+  FIELD_SOURCES,
+} from './lib/fields.js';
+import { buildSeaTexture, buildCloudTexture } from './lib/windField.js';
+import { readFieldCache, writeFieldCache } from './lib/fieldCache.js';
 
 const defaultLocation = {
   name: 'London',
@@ -53,21 +65,6 @@ const cityPresets = [
   { name: 'Reykjavik', latitude: 64.1466, longitude: -21.9426, country: 'Iceland' },
 ];
 
-function toRadians(deg) {
-  return (deg * Math.PI) / 180;
-}
-
-function latLonToVector3(lat, lon, radius = 1.55) {
-  const phi = (90 - lat) * (Math.PI / 180);
-  const theta = (lon + 180) * (Math.PI / 180);
-
-  const x = -(radius * Math.sin(phi) * Math.cos(theta));
-  const y = radius * Math.cos(phi);
-  const z = radius * Math.sin(phi) * Math.sin(theta);
-
-  return new THREE.Vector3(x, y, z);
-}
-
 function getWeatherLabel(code) {
   return weatherCodes[code] || { label: 'Weather', icon: '🌍' };
 }
@@ -85,9 +82,10 @@ async function fetchSearchSuggestions(query) {
   return data.results || [];
 }
 
-async function fetchWeatherData(location) {
+async function fetchWeatherData(location, signal) {
   const response = await fetch(
-    `https://api.open-meteo.com/v1/forecast?latitude=${location.latitude}&longitude=${location.longitude}&current=temperature_2m,apparent_temperature,relative_humidity_2m,pressure_msl,weather_code,wind_speed_10m,wind_direction_10m&hourly=temperature_2m,precipitation_probability,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=7`
+    `https://api.open-meteo.com/v1/forecast?latitude=${location.latitude}&longitude=${location.longitude}&current=temperature_2m,apparent_temperature,relative_humidity_2m,pressure_msl,weather_code,wind_speed_10m,wind_direction_10m&hourly=temperature_2m,precipitation_probability,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=7`,
+    { signal }
   );
 
   if (!response.ok) throw new Error('Weather service unavailable');
@@ -95,31 +93,165 @@ async function fetchWeatherData(location) {
   return response.json();
 }
 
-function App() {
+/** Index of the hour closest to now, so the globe opens on "live". */
+function nearestHour(field) {
+  const now = Date.now();
+  let best = 0;
+  let bestDelta = Infinity;
+
+  field.times.forEach((iso, index) => {
+    const delta = Math.abs(new Date(`${iso}Z`).getTime() - now);
+    if (delta < bestDelta) {
+      bestDelta = delta;
+      best = index;
+    }
+  });
+
+  return best;
+}
+
+function formatHour(iso) {
+  if (!iso) return '—';
+  const date = new Date(`${iso}Z`);
+  return date.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function relativeLabel(iso) {
+  if (!iso) return '';
+  const target = new Date(`${iso}Z`).getTime();
+  const diffHours = Math.round((target - Date.now()) / 3600000);
+
+  if (Math.abs(diffHours) < 1) return 'current hour';
+  if (diffHours > 0) return `+${diffHours} h ahead`;
+  return `${Math.abs(diffHours)} h earlier`;
+}
+
+/** Layers the user can toggle. */
+const LAYER_DEFS = [
+  { id: 'wind', label: 'Wind tracers', hint: 'Particles advected by 10 m u/v wind' },
+  { id: 'mist', label: 'Cloud mist', hint: 'Cloud-cover shells drifting with the flow' },
+  { id: 'sea', label: 'Sea temperature', hint: 'Sea surface temperature' },
+  { id: 'marker', label: 'City marker', hint: 'Selected location readout' },
+];
+
+export default function App() {
   const [query, setQuery] = useState('');
   const [selectedLocation, setSelectedLocation] = useState(defaultLocation);
   const [suggestions, setSuggestions] = useState([]);
   const [weather, setWeather] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
+  const [weatherError, setWeatherError] = useState('');
+  const [weatherLoading, setWeatherLoading] = useState(false);
+
+  const [field, setField] = useState(null);
+  const [fieldStatus, setFieldStatus] = useState({ state: 'idle', ratio: 0, error: null });
+  const [source, setSource] = useState('forecast');
+  const [hourIndex, setHourIndex] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [rate, setRate] = useState(1);
+  const [autoRotate, setAutoRotate] = useState(true);
+  const [layers, setLayers] = useState({ wind: true, mist: true, sea: true, marker: true });
+  const [seaTexture, setSeaTexture] = useState(null);
+  const [cloudTexture, setCloudTexture] = useState(null);
+
+  const loadField = useCallback(
+    async (nextSource, signal) => {
+      setFieldStatus({ state: 'loading', ratio: 0, error: null });
+      try {
+        // A cached field makes a reload instant and avoids spending rate-limit
+        // budget on data that is only a few minutes old.
+        const cached = readFieldCache(nextSource);
+        if (cached) {
+          setCloudTexture(buildCloudTexture(cached));
+          setField(cached);
+          setHourIndex(nearestHour(cached));
+          setFieldStatus({ state: 'ready', ratio: 1, error: null, cached: true });
+          return;
+        }
+
+        const loaded = await fetchGlobalFields({
+          source: nextSource,
+          signal,
+          onProgress: ({ ratio }) => setFieldStatus({ state: 'loading', ratio, error: null }),
+        });
+
+        if (signal?.aborted) return;
+
+        const best = nearestHour(loaded);
+
+        setField(loaded);
+        setHourIndex(best);
+        setCloudTexture(buildCloudTexture(loaded));
+        setFieldStatus({ state: 'ready', ratio: 1, error: null });
+        writeFieldCache(nextSource, loaded);
+      } catch (error) {
+        if (error?.name === 'AbortError') return;
+        setFieldStatus({ state: 'error', ratio: 0, error: error.message || 'Wind field unavailable' });
+      }
+    },
+    []
+  );
 
   useEffect(() => {
-    const loadWeather = async () => {
-      setLoading(true);
-      setError('');
+    const controller = new AbortController();
+    loadField(source, controller.signal);
+    return () => controller.abort();
+  }, [source, loadField]);
 
+  useEffect(() => {
+    const controller = new AbortController();
+
+    const run = async () => {
+      setWeatherLoading(true);
+      setWeatherError('');
       try {
-        const data = await fetchWeatherData(selectedLocation);
+        const data = await fetchWeatherData(selectedLocation, controller.signal);
         setWeather(data);
-      } catch (err) {
-        setError(err.message || 'Unable to load weather data.');
+      } catch (error) {
+        if (error?.name === 'AbortError') return;
+        setWeatherError(error.message || 'Unable to load weather data.');
       } finally {
-        setLoading(false);
+        if (!controller.signal.aborted) setWeatherLoading(false);
       }
     };
 
-    loadWeather();
+    run();
+    return () => controller.abort();
   }, [selectedLocation]);
+
+  // Rebuild the ocean texture when the hour changes. Building at the field's
+  // own resolution is fast enough to feel immediate while dragging.
+  useEffect(() => {
+    if (!field || !layers.sea) return;
+    const texture = buildSeaTexture(field, hourIndex);
+    setSeaTexture(texture);
+    return () => {
+      // Canvas textures hold a canvas element as well as GPU memory.
+      if (texture.image) {
+        texture.image.width = 0;
+        texture.image.height = 0;
+      }
+      texture.dispose();
+    };
+  }, [field, hourIndex, layers.sea]);
+
+  // Scrub the field's time axis while the tracers keep drifting.
+  useEffect(() => {
+    if (!playing || !field) return undefined;
+
+    const id = setInterval(() => {
+      setHourIndex((current) => {
+        const next = current + 1;
+        return next >= field.hours ? 0 : next;
+      });
+    }, Math.max(160, 900 / rate));
+
+    return () => clearInterval(id);
+  }, [playing, field, rate]);
 
   const handleSearch = async () => {
     if (!query.trim()) {
@@ -146,46 +278,48 @@ function App() {
     setSuggestions([]);
   };
 
+  const toggleLayer = (id) => setLayers((current) => ({ ...current, [id]: !current[id] }));
+
   const current = weather?.current;
   const daily = weather?.daily;
-  const hourly = weather?.hourly;
-
-  const airFlowCurves = useMemo(() => {
-    const points = [
-      { lat: 12, lon: -15 },
-      { lat: 32, lon: 10 },
-      { lat: 45, lon: 40 },
-      { lat: 10, lon: 80 },
-      { lat: -20, lon: 120 },
-      { lat: -40, lon: 160 },
-      { lat: -15, lon: -120 },
-      { lat: 25, lon: -90 },
-    ];
-
-    return points.map((point, index) => {
-      const start = latLonToVector3(selectedLocation.latitude, selectedLocation.longitude, 1.55);
-      const end = latLonToVector3(point.lat, point.lon, 1.55);
-      const mid = start.clone().add(end).multiplyScalar(0.52);
-      const offset = new THREE.Vector3(
-        (index % 2 === 0 ? 1 : -1) * 0.7,
-        (index % 3) * 0.25,
-        (index % 2 === 0 ? -1 : 1) * 0.7
-      );
-      const curve = new THREE.CatmullRomCurve3([
-        start,
-        mid.clone().add(offset),
-        end.clone().add(offset.clone().multiplyScalar(0.3)),
-        end,
-      ]);
-
-      return {
-        curve,
-        color: index % 2 === 0 ? '#67e8f9' : '#c084fc',
-      };
-    });
-  }, [selectedLocation]);
-
   const currentWeatherLabel = getWeatherLabel(current?.weather_code);
+
+  // Conditions sampled straight out of the gridded field, so the sidebar and
+  // the globe are reading the same numbers.
+  const sampled = useMemo(() => {
+    if (!field) return null;
+
+    const { latitude, longitude } = selectedLocation;
+    const windSpeed = sampleField(field, 'speed', latitude, longitude, hourIndex);
+    const windDir = sampleField(field, 'direction', latitude, longitude, hourIndex);
+    const cloud = sampleField(field, 'cloud', latitude, longitude, hourIndex);
+    const temp = sampleField(field, 'temp', latitude, longitude, hourIndex);
+    const sst = sampleField(field, 'sst', latitude, longitude, hourIndex);
+
+    return { windSpeed, windDir, cloud, temp, sst };
+  }, [field, selectedLocation, hourIndex]);
+
+  const windExtent = useMemo(
+    () => (field ? fieldExtent(field, 'speed', hourIndex) : { min: 0, max: 0 }),
+    [field, hourIndex]
+  );
+
+  const seaExtent = useMemo(() => {
+    if (!field) return { min: 0, max: 0 };
+    return fieldExtent(field, 'sst', hourIndex, (f, i, j, value) => Number.isFinite(value) && value !== 0);
+  }, [field, hourIndex]);
+
+  const activeSource = FIELD_SOURCES[source];
+  const busy = fieldStatus.state === 'loading';
+
+  // The field records how much of each layer actually arrived, so a rate-limited
+  // load is reported rather than quietly drawn as if it were complete.
+  const partial = Boolean(
+    field &&
+      (field.sstMode === 'era5-fallback' ||
+        field.coverage?.windFailures > 0 ||
+        (field.coverage?.sst ?? 1) < 0.5)
+  );
 
   return (
     <div className="app-shell">
@@ -205,17 +339,26 @@ function App() {
               id="location-search"
               type="text"
               value={query}
-              onChange={(e) => setQuery(e.target.value)}
+              onChange={(event) => setQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') handleSearch();
+              }}
               placeholder="Search a city..."
               aria-label="Search city"
             />
-            <button type="button" onClick={handleSearch}>Locate</button>
+            <button type="button" onClick={handleSearch}>
+              Locate
+            </button>
           </div>
 
           {suggestions.length > 0 && (
             <div className="suggestions">
               {suggestions.map((item) => (
-                <button key={`${item.name}-${item.latitude}-${item.longitude}`} type="button" onClick={() => handleSelect(item)}>
+                <button
+                  key={`${item.name}-${item.latitude}-${item.longitude}`}
+                  type="button"
+                  onClick={() => handleSelect(item)}
+                >
                   {item.name} · {item.country || item.admin1 || 'Worldwide'}
                 </button>
               ))}
@@ -225,15 +368,14 @@ function App() {
 
         <motion.div
           className="status-card"
-          key={selectedLocation.name}
-          initial={{ opacity: 0, y: 14 }}
+          initial={{ opacity: 0, y: 12 }}
           animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.45, ease: "easeOut" }}
+          transition={{ duration: 0.4, ease: 'easeOut' }}
         >
-          {loading ? (
+          {weatherLoading ? (
             <div className="loading-message">Loading atmospheric data...</div>
-          ) : error ? (
-            <div className="error-message">{error}</div>
+          ) : weatherError ? (
+            <div className="error-message">{weatherError}</div>
           ) : (
             <>
               <div className="status-header">
@@ -248,7 +390,9 @@ function App() {
 
               <div className="temperature-row">
                 <span className="temperature">{Math.round(current?.temperature_2m ?? 0)}°</span>
-                <span className="temperature-meta">Feels like {Math.round(current?.apparent_temperature ?? 0)}°</span>
+                <span className="temperature-meta">
+                  Feels like {Math.round(current?.apparent_temperature ?? 0)}°
+                </span>
               </div>
 
               <div className="stat-grid">
@@ -281,16 +425,14 @@ function App() {
 
           <div className="forecast-list">
             {daily?.time?.map((day, index) => {
-              const code = daily.weather_code[index];
-              const label = getWeatherLabel(code);
-              const max = Math.round(daily.temperature_2m_max[index]);
-              const min = Math.round(daily.temperature_2m_min[index]);
-
+              const label = getWeatherLabel(daily.weather_code[index]);
               return (
                 <div key={day} className="forecast-item">
                   <span>{new Date(day).toLocaleDateString('en-US', { weekday: 'short' })}</span>
                   <strong>{label.icon}</strong>
-                  <span>{max}° / {min}°</span>
+                  <span>
+                    {Math.round(daily.temperature_2m_max[index])}° / {Math.round(daily.temperature_2m_min[index])}°
+                  </span>
                 </div>
               );
             })}
@@ -301,119 +443,189 @@ function App() {
       <main className="globe-panel">
         <div className="map-header">
           <div>
-            <p className="eyebrow">Air currents</p>
-            <h2>Global flow model</h2>
+            <p className="eyebrow">Wind field physics</p>
+            <h2>Global circulation</h2>
           </div>
           <div className="header-badges">
-            <span>Live</span>
-            <span>Open-Meteo</span>
+            <span>{activeSource.label}</span>
+            <span>{FIELD_SOURCES.forecast.detail}</span>
           </div>
         </div>
 
         <div className="globe-shell">
-          <Canvas camera={{ position: [0, 0, 5], fov: 45 }}>
-            <color attach="background" args={['#07111f']} />
-            <fog attach="fog" args={['#07111f', 5, 12]} />
-            <ambientLight intensity={0.8} />
-            <directionalLight position={[5, 2, 5]} intensity={1.4} color="#dbeafe" />
-            <Stars radius={60} depth={30} count={5000} factor={3} saturation={0} fade speed={0.8} />
-
-            <GlobeComponent location={selectedLocation} weather={weather} airFlowCurves={airFlowCurves} />
-
-            <OrbitControls enableZoom={false} enablePan={false} autoRotate autoRotateSpeed={0.6} />
+          <Canvas
+            camera={{ position: [0, 0, 5], fov: 45 }}
+            dpr={[1, 2]}
+            gl={{ antialias: true, powerPreference: 'high-performance' }}
+          >
+            <GlobeScene
+              field={field}
+              time={hourIndex}
+              layers={layers}
+              rate={rate}
+              density={layers.mist ? 1 : 0}
+              seaTexture={seaTexture}
+              cloudTexture={cloudTexture}
+              autoRotate={autoRotate}
+              location={selectedLocation}
+              weather={weather}
+            />
           </Canvas>
+
+          {busy && (
+            <div className="globe-overlay">
+              <div className="loading-message">Sampling the global wind field…</div>
+              <div className="progress-track">
+                <div className="progress-fill" style={{ width: `${Math.round(fieldStatus.ratio * 100)}%` }} />
+              </div>
+              <p className="overlay-note">
+                {Math.round(fieldStatus.ratio * 100)}% · {LAT_STEP}° grid, {PAST_DAYS}d history +{' '}
+                {FORECAST_DAYS}d forecast
+              </p>
+            </div>
+          )}
+
+          {fieldStatus.state === 'error' && (
+            <div className="globe-overlay">
+              <div className="error-message">{fieldStatus.error}</div>
+              <button type="button" onClick={() => loadField(source, undefined)}>
+                Retry
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="timeline-bar">
+          <button type="button" className="play-button" onClick={() => setPlaying((p) => !p)} disabled={!field}>
+            {playing ? '❚❚' : '▶'}
+          </button>
+
+          <div className="timeline-main">
+            <input
+              type="range"
+              min={0}
+              max={Math.max((field?.hours ?? 1) - 1, 0)}
+              value={hourIndex}
+              onChange={(event) => setHourIndex(Number(event.target.value))}
+              disabled={!field}
+              aria-label="Forecast hour"
+            />
+            <div className="timeline-meta">
+              <strong>{formatHour(field?.times?.[hourIndex])}</strong>
+              <span>{relativeLabel(field?.times?.[hourIndex])}</span>
+            </div>
+          </div>
+
+          <label className="rate-control">
+            <span>Speed</span>
+            <input
+              type="range"
+              min={0.25}
+              max={3}
+              step={0.25}
+              value={rate}
+              onChange={(event) => setRate(Number(event.target.value))}
+            />
+            <strong>{rate}×</strong>
+          </label>
+
+          <button type="button" className="ghost-button" onClick={() => setAutoRotate((v) => !v)}>
+            {autoRotate ? 'Pause spin' : 'Auto spin'}
+          </button>
+        </div>
+
+        <div className="controls-row">
+          <div className="layer-chips">
+            {LAYER_DEFS.map((layer) => (
+              <button
+                key={layer.id}
+                type="button"
+                className={`chip ${layers[layer.id] ? 'chip-on' : ''}`}
+                onClick={() => toggleLayer(layer.id)}
+                title={layer.hint}
+              >
+                {layer.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="source-picker">
+            {Object.values(FIELD_SOURCES).map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                className={`chip ${source === item.id ? 'chip-on' : ''}`}
+                onClick={() => setSource(item.id)}
+                title={item.detail}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
         </div>
 
         <div className="metrics-bar">
           <div>
-            <span>Cloud cover</span>
-            <strong>{Math.min(100, Math.max(0, (hourly?.precipitation_probability?.[0] ?? 0) + 10))}%</strong>
+            <span>Field wind @ city</span>
+            <strong>{Math.round(sampled?.windSpeed ?? 0)} km/h</strong>
           </div>
           <div>
-            <span>Air mass</span>
-            <strong>{Math.round(current?.wind_speed_10m ?? 0) > 25 ? 'Dynamic' : 'Stable'}</strong>
+            <span>Peak field wind</span>
+            <strong>{Math.round(windExtent.max)} km/h</strong>
           </div>
           <div>
-            <span>Trend</span>
-            <strong>{Math.round(current?.temperature_2m ?? 0) > 20 ? 'Warm' : 'Cool'}</strong>
+            <span>Cloud cover @ city</span>
+            <strong>{Math.round(sampled?.cloud ?? 0)}%</strong>
           </div>
+          <div>
+            <span>Sea surface temp</span>
+            <strong>
+              {sampled?.sst ? `${sampled.sst.toFixed(1)} °C` : '—'}
+            </strong>
+          </div>
+        </div>
+
+        <div className="legend-bar">
+          <div className="legend">
+            <span className="legend-title">Sea temp</span>
+            <div className="ramp ramp-sea" />
+            <span className="legend-range">
+              {seaExtent.min.toFixed(1)}° – {seaExtent.max.toFixed(1)}°C
+            </span>
+          </div>
+
+          <div className="legend">
+            <span className="legend-title">Wind</span>
+            <div className="ramp ramp-wind" />
+            <span className="legend-range">
+              calm → {Math.round(windExtent.max)} km/h
+            </span>
+          </div>
+
+          {partial && (
+            <p className="coverage-note">
+              {field.sstMode === 'era5-fallback'
+                ? `Live ocean data was rate-limited, so sea temperature is showing the ERA5 reanalysis for ${field.sstFallbackDate}. `
+                : field.coverage.sst < 0.5
+                ? `Ocean layer is only ${Math.round(field.coverage.sst * 100)}% complete (${
+                    field.coverage.sstFailures
+                  } request${field.coverage.sstFailures === 1 ? '' : 's'} rate-limited). `
+                : ''}
+              {field.coverage.windFailures > 0
+                ? `${field.coverage.windFailures} wind request${
+                    field.coverage.windFailures === 1 ? '' : 's'
+                  } were rate-limited, so gaps are filled from neighbouring cells. `
+                : ''}
+              Reload in a minute for full coverage.
+            </p>
+          )}
+
+          <p className="attribution">
+            {activeSource.attribution} · {LAT_STEP}° × {LON_STEP}° sampled grid · u/v advected at real
+            wind speed
+          </p>
         </div>
       </main>
     </div>
   );
 }
-
-function GlobeComponent({ location, weather, airFlowCurves }) {
-  const selectedVec = useMemo(
-    () => latLonToVector3(location.latitude, location.longitude, 1.82),
-    [location]
-  );
-
-  const selectedWeather = weather?.current;
-  const windSpeed = selectedWeather?.wind_speed_10m ?? 15;
-
-  return (
-    <group>
-      <mesh>
-        <sphereGeometry args={[1.5, 64, 64]} />
-        <meshStandardMaterial
-          color="#0f172a"
-          emissive="#1e3a8a"
-          emissiveIntensity={0.25}
-          roughness={0.8}
-          metalness={0.15}
-        />
-      </mesh>
-
-      <mesh scale={1.08}>
-        <sphereGeometry args={[1.5, 64, 64]} />
-        <meshBasicMaterial color="#38bdf8" transparent opacity={0.14} />
-      </mesh>
-
-      {airFlowCurves.map((arc, index) => (
-        <group key={index}>
-          <Tube args={[arc.curve, 160, 0.008, 4, false]}>
-            <meshStandardMaterial color={arc.color} emissive={arc.color} emissiveIntensity={0.8} />
-          </Tube>
-        </group>
-      ))}
-
-      {Array.from({ length: 32 }).map((_, index) => {
-        const lat = (index * 17) % 180 - 90;
-        const lon = (index * 29) % 360 - 180;
-        const pos = latLonToVector3(lat, lon, 1.74);
-
-        return (
-          <mesh key={`${lat}-${lon}`} position={pos.toArray()}>
-            <sphereGeometry args={[0.02, 10, 10]} />
-            <meshBasicMaterial color={index % 2 === 0 ? '#7dd3fc' : '#c4b5fd'} />
-          </mesh>
-        );
-      })}
-
-      <mesh position={selectedVec.toArray()}>
-        <sphereGeometry args={[0.09 + windSpeed / 100, 32, 32]} />
-        <meshStandardMaterial color="#fbbf24" emissive="#f59e0b" emissiveIntensity={1.4} />
-      </mesh>
-
-      <Html position={selectedVec.toArray()} center distanceFactor={7} zIndexRange={[10, 0]}>
-        <div className="marker-readout">
-          <span className="marker-wind">{Math.round(windSpeed)} km/h</span>
-          <span className="marker-temp">{Math.round(selectedWeather?.temperature_2m ?? 0)}°</span>
-        </div>
-      </Html>
-
-      <Text
-        position={[selectedVec.x * 0.9, selectedVec.y * 0.9, selectedVec.z * 0.9]}
-        fontSize={0.12}
-        color="#f8fafc"
-        anchorX="center"
-        anchorY="middle"
-      >
-        {location.name}
-      </Text>
-    </group>
-  );
-}
-
-export default App;
