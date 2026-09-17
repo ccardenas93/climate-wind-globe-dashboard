@@ -1,2 +1,19 @@
-# climate-wind-globe-dashboard
-Interactive 3D weather dashboard visualizing global wind currents with public Open-Meteo data.
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Dependencies
+node_modules
+
+# Build output
+/dist
+/.vite
+
+# Editor files
+.vscode/
+.DS_Store
+
+# Environment
+.env
+.env.*
